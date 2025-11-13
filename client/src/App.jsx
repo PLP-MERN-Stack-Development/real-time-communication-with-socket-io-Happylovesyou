@@ -1,8 +1,7 @@
-
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import io from "socket.io-client";
 
-const socket = io("http://localhost:5000"); // ✅ Connect to your backend
+const socket = io("http://localhost:5000"); // Connect to backend
 
 function App() {
   const [username, setUsername] = useState("");
@@ -11,6 +10,14 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [onlineUsers, setOnlineUsers] = useState([]);
   const [typingUsers, setTypingUsers] = useState([]);
+  const [selectedUser, setSelectedUser] = useState(null); // Private messaging
+  const messagesEndRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+
+  // Scroll to bottom when messages update
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   // Join chat
   const handleJoin = () => {
@@ -20,54 +27,93 @@ function App() {
     }
   };
 
-  // Send message
+  // Send message (global or private)
   const sendMessage = () => {
-    if (message.trim()) {
-      socket.emit("send_message", { text: message });
-      setMessage("");
+    if (!message.trim()) return;
+
+    if (selectedUser) {
+      socket.emit("private_message", { to: selectedUser.id, message });
+    } else {
+      socket.emit("send_message", { message });
     }
+
+    setMessage("");
+    setSelectedUser(null);
   };
 
-  // Handle typing indicator
+  // Typing indicator with debounce
   useEffect(() => {
     if (!isJoined) return;
 
     if (message.trim()) {
       socket.emit("typing", true);
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = setTimeout(() => {
+        socket.emit("typing", false);
+      }, 1500);
     } else {
       socket.emit("typing", false);
     }
-
-    const timeout = setTimeout(() => {
-      socket.emit("typing", false);
-    }, 2000);
-
-    return () => clearTimeout(timeout);
   }, [message, isJoined]);
 
-  // Listen for messages, users, and typing
+  // Listen for socket events
   useEffect(() => {
     socket.on("receive_message", (newMessage) => {
-      setMessages((prev) => [...prev, newMessage]);
+      setMessages((prev) => [...prev, { ...newMessage, reactions: [], readBy: [] }]);
+      playNotification(newMessage);
     });
 
-    socket.on("user_list", (users) => {
-      console.log("Received users:", users); // ✅
-      setOnlineUsers(users);
+    socket.on("private_message", (newMessage) => {
+      setMessages((prev) => [...prev, { ...newMessage, reactions: [], readBy: [] }]);
+      playNotification(newMessage);
     });
 
-    socket.on("typing_users", (users) => {
-      setTypingUsers(users);
+    socket.on("message_updated", (updatedMessage) => {
+      setMessages((prev) =>
+        prev.map((msg) => (msg.id === updatedMessage.id ? updatedMessage : msg))
+      );
     });
+
+    socket.on("user_list", (users) => setOnlineUsers(users));
+    socket.on("typing_users", (users) => setTypingUsers(users));
 
     return () => {
       socket.off("receive_message");
+      socket.off("private_message");
+      socket.off("message_updated");
       socket.off("user_list");
       socket.off("typing_users");
     };
+  }, [username]);
+
+  // Notification
+  const playNotification = (msg) => {
+    if (msg.sender !== username) {
+      // Sound
+      const audio = new Audio("/notification.mp3");
+      audio.play();
+      // Browser
+      if (Notification.permission === "granted") {
+        new Notification(`New message from ${msg.sender}`, { body: msg.message });
+      }
+    }
+  };
+
+  // Request notification permission
+  useEffect(() => {
+    if (Notification.permission !== "granted") Notification.requestPermission();
   }, []);
 
-  // UI
+  // Add reaction
+  const addReaction = (msgId, reaction) => {
+    socket.emit("message_reaction", { msgId, reaction, user: username });
+  };
+
+  // Mark message as read
+  const markAsRead = (msgId) => {
+    socket.emit("message_read", { msgId, user: username });
+  };
+
   return (
     <div style={{ fontFamily: "Arial", padding: 20 }}>
       {!isJoined ? (
@@ -86,7 +132,6 @@ function App() {
           {/* Left side: Chat */}
           <div style={{ flex: 3 }}>
             <h2>Global Chat</h2>
-
             <div
               style={{
                 border: "1px solid #ccc",
@@ -96,19 +141,55 @@ function App() {
                 marginBottom: 10,
               }}
             >
-              {messages.map((msg) => (
-                <div key={msg.id}>
-                  <strong>{msg.sender}:</strong> {msg.text}{" "}
-                  <span style={{ fontSize: "0.8em", color: "gray" }}>
-                    ({new Date(msg.timestamp).toLocaleTimeString()})
-                  </span>
-                </div>
-              ))}
+              {messages.map((msg) => {
+                const isPrivate = msg.isPrivate && (msg.senderId === socket.id || msg.to === socket.id);
+                return (
+                  <div
+                    key={msg.id}
+                    onClick={() => markAsRead(msg.id)}
+                    style={{
+                      marginBottom: 5,
+                      backgroundColor: isPrivate ? "#f0f0f0" : "transparent",
+                      padding: isPrivate ? "2px 5px" : 0,
+                      borderRadius: 4,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <strong>{msg.sender === username ? "You" : msg.sender}:</strong> {msg.message}{" "}
+                    {isPrivate && <span style={{ fontSize: "0.7em", color: "blue" }}>(private)</span>}
+                    <span style={{ fontSize: "0.8em", color: "gray" }}>
+                      ({new Date(msg.timestamp).toLocaleTimeString()})
+                    </span>
+
+                    {/* Reactions */}
+                    <div>
+                      {["👍", "❤️", "😂"].map((r) => (
+                        <button key={r} style={{ marginLeft: 5 }} onClick={() => addReaction(msg.id, r)}>
+                          {r}
+                        </button>
+                      ))}
+                      {msg.reactions?.length > 0 && (
+                        <span style={{ marginLeft: 5, fontSize: "0.8em", color: "green" }}>
+                          {msg.reactions.map((r) => r.reaction).join(" ")}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Read receipts */}
+                    {msg.readBy?.length > 0 && (
+                      <div style={{ fontSize: "0.7em", color: "purple" }}>
+                        Read by: {msg.readBy.join(", ")}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <div ref={messagesEndRef} />
             </div>
 
             <input
               type="text"
-              placeholder="Type a message..."
+              placeholder={selectedUser ? `Private message to ${selectedUser.username}` : "Type a message..."}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && sendMessage()}
@@ -118,7 +199,7 @@ function App() {
 
             {typingUsers.length > 0 && (
               <p style={{ fontStyle: "italic", color: "gray" }}>
-                {typingUsers.join(", ")} typing...
+                {typingUsers.filter((u) => u !== username).join(", ")} typing...
               </p>
             )}
           </div>
@@ -127,9 +208,19 @@ function App() {
           <div style={{ flex: 1 }}>
             <h3>Online Users ({onlineUsers.length})</h3>
             <ul>
-              {onlineUsers.map((user) => (
-                <li key={user.id}>{user.username}</li>
-              ))}
+              {onlineUsers
+                .filter((user) => user.username !== username)
+                .map((user) => (
+                  <li key={user.id}>
+                    {user.username}{" "}
+                    <button
+                      onClick={() => setSelectedUser(user)}
+                      style={{ fontSize: "0.8em", marginLeft: 5 }}
+                    >
+                      Chat
+                    </button>
+                  </li>
+                ))}
             </ul>
           </div>
         </div>
